@@ -1,431 +1,457 @@
 # WindPulse Wind Forecast Evaluation API
 
-A production-grade Python backend built with **FastAPI**, **Pydantic v2**, and **httpx** for a UK energy utility. This service retrieves, matches, and evaluates Elexon BMRS day-ahead wind generation forecasts against actual metered wind generation across the UK national grid during **January 2026**.
+A Python REST API built with **FastAPI, Pydantic v2, and HTTPX** to retrieve, match, and evaluate UK wind generation forecasts against actual generation data from the Elexon BMRS API.
 
----
+The backend applies a configurable day-ahead forecast selection rule, calculates forecast accuracy metrics, and reports data coverage without fabricating missing observations.
 
 ## Table of Contents
 
-- [Overview & Architecture](#overview--architecture)
+- [Overview and Architecture](#overview-and-architecture)
 - [Key Features](#key-features)
+- [Technology Stack](#technology-stack)
 - [Project Structure](#project-structure)
-- [Day-Ahead Decision Rule & Assumptions](#day-ahead-decision-rule--assumptions)
-- [Accuracy Metrics & Definitions](#accuracy-metrics--definitions)
+- [Day-Ahead Decision Rule](#day-ahead-decision-rule)
+- [Accuracy Metrics](#accuracy-metrics)
 - [Environment Variables](#environment-variables)
-- [Getting Started (Windows PowerShell)](#getting-started-windows-powershell)
+- [Getting Started](#getting-started)
 - [Running Tests](#running-tests)
-- [API Endpoints & Usage](#api-endpoints--usage)
+- [API Endpoints](#api-endpoints)
 - [Docker Deployment](#docker-deployment)
-- [Frontend Integration Notes](#frontend-integration-notes)
+- [Frontend Integration](#frontend-integration)
+- [AI Tools Used](#ai-tools-used)
+- [Security Considerations](#security-considerations)
 
----
+## Overview and Architecture
 
-## Overview & Architecture
+Electricity generation forecasts can help analysts understand expected wind power output. Evaluating these forecasts against actual generation requires consistent timestamps, clear forecast selection rules, and reliable error calculations.
 
-Electricity utility trading desks make binding purchase commitments in day-ahead power auctions. To evaluate whether forecast models are providing actionable signals, utility analysts need:
+WindPulse provides an API that:
 
-1. **Strict temporal cutoff rules**: Forecasts published after the day-ahead auction cutoff must be discarded to prevent lookahead bias / data leakage.
-2. **Latest available forecast selection**: Among all forecasts published prior to the gate closure, only the most recently updated forecast represents what a trader could actually observe.
-3. **Rigorous error metrics**: Standardized metrics (MAE, RMSE, Bias) in Megawatts (MW) to measure both error scale and directional skew (over- vs. under-forecasting).
-4. **Data completeness accounting**: Transparent reporting of matched versus missing observations without fabricating data.
+1. Retrieves actual wind generation and forecast records from Elexon BMRS.
+2. Filters forecasts using a configurable day-ahead decision cutoff.
+3. Selects the latest eligible forecast for each target delivery timestamp.
+4. Matches forecasts with actual observations.
+5. Calculates accuracy metrics in megawatts and percentages.
+6. Reports matched, missing, and unmatched records.
 
-```
-                           ELEXON BMRS API
-                                  │
-         ┌────────────────────────┴────────────────────────┐
-         ▼                                                 ▼
-FUELHH Dataset Stream                             WINDFOR Dataset Stream
-(Actuals: fuelType=WIND)                          (Forecasts: hourly startTimes)
-         │                                                 │
-         │                                                 ▼
-         │                                    Day-Ahead Decision Filter
-         │                                    (publishTime <= D-1 at 12:00 UTC)
-         │                                                 │
-         │                                                 ▼
-         │                                    Select Latest Pre-Cutoff Forecast
-         │                                    max(publishTime) per target startTime
-         │                                                 │
-         └────────────────────────┬────────────────────────┘
-                                  ▼
-                   Target startTime Matcher
-                   (Deduplication & Missing Tracking)
-                                  │
-                                  ▼
-                     Accuracy Metrics Service
-                     (MAE, RMSE, Bias, nMAE, MAPE)
-                                  │
-                                  ▼
-                        FastAPI REST API
-           /health │ /actuals │ /forecasts │ /evaluation
+### Architecture
+
+```text
+                 Elexon BMRS API
+                  /            \
+                 /              \
+          FUELHH Actuals     WINDFOR Forecasts
+                 |              |
+                 |       Decision Cutoff Filter
+                 |              |
+                 |       Latest Eligible Forecast
+                 |              |
+                 +-------+------+
+                         |
+                  Timestamp Matching
+                         |
+                  Accuracy Metrics
+                         |
+                    FastAPI REST API
+                         |
+             React Frontend / API Clients
 ```
 
----
+The application uses the `FUELHH` dataset for half-hourly generation outturn and `WINDFOR` for wind generation forecasts. See the [official Elexon API documentation](https://bmrs.elexon.co.uk/api-documentation/endpoint).
 
 ## Key Features
 
-- **FastAPI + Uvicorn**: High-performance asynchronous REST API with automatic OpenAPI Swagger UI.
-- **Pydantic v2 Validation**: Strict typing, request validation, and self-documenting response schemas.
-- **Zero Data Leakage**: Enforces that for any delivery on date $D$, only forecasts published on or before Day $D-1$ at the cutoff hour (default 12:00 UTC) are considered.
-- **Elexon BMRS Client**: Asynchronous `httpx` client with query caching, timeout handling, and graceful HTTP error degradation.
-- **Comprehensive Test Suite**: Automated unit and integration tests covering forecast selection, metrics, API routes, UTC boundaries, and daylight saving time transitions.
-- **CORS Configured**: Ready for local React frontend development with configurable origins.
+- **FastAPI REST API:** Provides endpoints with automatically generated OpenAPI documentation.
+- **Pydantic v2:** Supports typed data models and validation.
+- **Asynchronous HTTP requests:** Uses HTTPX to communicate with the external API.
+- **Forecast cutoff filtering:** Excludes forecasts published after the configured decision cutoff.
+- **Latest forecast selection:** Chooses the most recently published eligible forecast for each target timestamp.
+- **Forecast and actual matching:** Matches records using their target delivery timestamps.
+- **Accuracy metrics:** Calculates MAE, RMSE, bias, nMAE, and MAPE.
+- **Missing-data reporting:** Tracks unmatched observations without synthetic interpolation.
+- **Configurable CORS:** Allows approved frontend origins to access the API.
+- **Automated tests:** Supports unit and API tests using pytest.
+- **Docker support:** Includes a container configuration for running the backend.
 
----
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| Programming language | Python 3.11+ |
+| API framework | FastAPI |
+| Data validation | Pydantic v2 |
+| HTTP client | HTTPX |
+| ASGI server | Uvicorn |
+| Configuration | Pydantic Settings and environment variables |
+| Testing | Pytest and pytest-asyncio |
+| External data | Elexon BMRS API |
+| Containerization | Docker |
+| Version control | Git and GitHub |
 
 ## Project Structure
 
-```
-windpulse-backend/
-├── .env.example              # Environment variables template
-├── .gitignore                # Git ignore rules for Python, venv, and cache
-├── Dockerfile                # Production container specification
-├── pyproject.toml            # Project metadata and pytest configuration
-├── requirements.txt          # Pinned runtime and testing dependencies
-├── README.md                 # Project documentation
+```text
+backend/
+├── .env.example
+├── .gitignore
+├── .python-version
+├── Dockerfile
+├── pyproject.toml
+├── requirements.txt
+├── README.md
 ├── app/
-│   ├── __init__.py           # Application package marker
-│   ├── main.py               # FastAPI entry point, CORS, and exception handlers
-│   ├── config.py             # Settings using Pydantic BaseSettings
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config.py
 │   ├── api/
 │   │   ├── __init__.py
-│   │   └── routes.py         # Route handlers for health, actuals, forecasts, evaluation
+│   │   └── routes.py
 │   ├── clients/
 │   │   ├── __init__.py
-│   │   └── elexon_client.py  # Async HTTP client querying FUELHH and WINDFOR streams
+│   │   └── elexon_client.py
 │   ├── models/
 │   │   ├── __init__.py
-│   │   └── schemas.py        # Pydantic schemas for requests, responses, and records
+│   │   └── schemas.py
 │   └── services/
 │       ├── __init__.py
-│       ├── forecast_service.py # Cutoff logic, forecast selection, and timeseries matching
-│       └── metrics_service.py  # Quantitative calculation of MAE, RMSE, Bias, etc.
+│       ├── forecast_service.py
+│       └── metrics_service.py
 └── tests/
     ├── __init__.py
-    ├── conftest.py           # Shared test fixtures (mock records, test client)
-    ├── test_forecast_selection.py # Tests for cutoff calculation & data leakage prevention
-    ├── test_metrics.py       # Hand-calculated tests for MAE, RMSE, Bias, edge cases
-    └── test_routes.py        # Integration tests for API endpoints with mocked client
+    ├── conftest.py
+    ├── test_forecast_selection.py
+    ├── test_metrics.py
+    └── test_routes.py
 ```
 
----
+The structure above represents the main application modules. The exact files and available tests may vary with the current repository version.
 
-## Day-Ahead Decision Rule & Assumptions
+## Day-Ahead Decision Rule
 
-### 1. Decision Cutoff Time
-- **GB Market Context**: In Great Britain's power market (EPEX SPOT and Nord Pool Day-Ahead Auctions), the primary day-ahead auction gate closure is at **12:00 UTC (noon) on day D-1** (the calendar day preceding delivery).
-- **Rule Definition**: For any target delivery timestamp `startTime` on calendar date $D$, the purchasing cutoff deadline is:
-  $$\text{Cutoff} = (D - 1\text{ day}) \text{ at } 12:00:00\text{ UTC}$$
-- **Configurability**: The cutoff hour is configurable via `DAY_AHEAD_DECISION_CUTOFF_HOUR` in `.env` (default: `12`) or via the `cutoff_hour` query parameter on `/api/v1/wind/evaluation` (e.g. `?cutoff_hour=17`).
+### 1. Configurable cutoff
 
-### 2. Forecast Selection Rule
-- For each target delivery half-hour, multiple forecasts may have been published prior to the cutoff (e.g. 2 days prior, 1 day prior at 06:00, 1 day prior at 11:30).
-- The service selects the **latest forecast published at or before the cutoff**:
-  $$\text{Selected Forecast} = \arg\max_{f \in \{f \mid \text{publishTime} \le \text{Cutoff}\}} (f.\text{publishTime})$$
-- Forecasts published after the cutoff (`publishTime > Cutoff`) are **strictly excluded**.
+WindPulse uses a configurable cutoff to determine which forecasts are eligible for evaluation.
 
-### 3. Timestamp Resolution & Missing Data Handling
-- **FUELHH (Actuals)**: Published at half-hourly resolution (48 settlement periods per day: `00:00`, `00:30`, `01:00`, etc.). Total for 31 days in January 2026 = 1,488 records.
-- **WINDFOR (Forecasts)**: Published at hourly resolution (`00:00`, `01:00`, `02:00`, etc.).
-- **No Data Fabrication**: The prompt explicitly specifies: *“Do not fabricate missing observations or forecasts.”*
-  Therefore, the service matches records by exact target `startTime` (`WINDFOR.startTime == FUELHH.startTime`).
-  - Top-of-the-hour periods (`:00`) match cleanly (744 matched observations across January 2026).
-  - Half-hour periods (`:30`) are faithfully documented in `summary.missingForecastCount` (744 periods) without synthetic interpolation.
+For a target delivery date \(D\), the default application rule is:
 
----
+\[
+\text{Cutoff}(D) = (D-1)\text{ at 12:00 UTC}
+\]
 
-## Accuracy Metrics & Definitions
+The default cutoff hour is `12`, configurable through `DAY_AHEAD_DECISION_CUTOFF_HOUR` or the `cutoff_hour` query parameter on the evaluation endpoint.
 
-All generation values and absolute error metrics are reported in **Megawatts (MW)**.
+**Important:** This is the application's configured evaluation rule. It should not be interpreted as a universal statement of every Great Britain market's auction deadline.
 
-| Metric | Formula | Definition & Interpretation |
-| :--- | :--- | :--- |
-| **Error ($e_i$)** | $\hat{y}_i - y_i$ | Difference between forecast ($\hat{y}$) and actual ($y$). Positive indicates over-forecasting; negative indicates under-forecasting. |
-| **MAE** | $\frac{1}{N} \sum_{i=1}^N \|\hat{y}_i - y_i\|$ | **Mean Absolute Error (MW)**. Average magnitude of forecast errors, regardless of direction. |
-| **RMSE** | $\sqrt{\frac{1}{N} \sum_{i=1}^N (\hat{y}_i - y_i)^2}$ | **Root Mean Squared Error (MW)**. Penalizes large forecast misses more heavily than small ones. |
-| **Bias** | $\frac{1}{N} \sum_{i=1}^N (\hat{y}_i - y_i)$ | **Mean Forecast Error (MW)**. Average signed error. If Bias $> 0$, the forecast systematically over-predicts wind output. |
-| **nMAE** | $\frac{\text{MAE}}{\bar{y}} \times 100\%$ | **Normalized MAE (%)**. MAE relative to average actual wind generation. |
-| **MAPE** | $\frac{1}{N_{nz}} \sum_{y_i > 0} \frac{\|\hat{y}_i - y_i\|}{y_i} \times 100\%$ | **Mean Absolute Percentage Error (%)**. Average percentage error over periods with non-zero generation. |
+### 2. Forecast selection
 
----
+For each target delivery timestamp, the service considers forecasts published at or before the applicable cutoff and selects the latest eligible publication.
+
+\[
+f^* = \arg\max_{f \in F,\;p_f \leq C} p_f
+\]
+
+Where:
+
+- \(F\) is the set of forecasts for a target delivery timestamp.
+- \(p_f\) is the publication timestamp of a forecast.
+- \(C\) is the configured cutoff.
+- \(f^*\) is the selected forecast.
+
+Forecasts published after the cutoff are excluded from that evaluation.
+
+### 3. Timestamp matching and missing data
+
+The actual generation dataset is half-hourly, while the forecast dataset is hourly in the evaluation workflow described here.
+
+The service matches records according to the implementation's timestamp matching rules. Where no eligible forecast or corresponding actual record exists, the missing observation is reported rather than fabricated or interpolated.
+
+For January 2026, a complete half-hourly actual series contains 1,488 periods, while an hourly series contains 744 periods. These are expected counts for the calendar month, not a guarantee that the API will return every record.
+
+## Accuracy Metrics
+
+The metrics use matched actual and forecast observations. Generation and absolute error values are expressed in megawatts (MW).
+
+Let:
+
+- \(y_i\) be the actual generation.
+- \(\hat{y}_i\) be the forecast generation.
+- \(N\) be the number of matched observations.
+- \(e_i = \hat{y}_i-y_i\) be the signed forecast error.
+
+| Metric | Formula | Interpretation |
+|---|---|---|
+| MAE | \(\frac{1}{N}\sum_{i=1}^{N}|e_i|\) | Average absolute forecast error in MW |
+| RMSE | \(\sqrt{\frac{1}{N}\sum_{i=1}^{N}e_i^2}\) | Error measure that gives greater weight to larger errors |
+| Bias | \(\frac{1}{N}\sum_{i=1}^{N}e_i\) | Signed average error; positive indicates over-forecasting |
+| nMAE | \(\frac{\mathrm{MAE}}{\bar{y}}\times100\%\) | MAE normalized by mean actual generation |
+| MAPE | \(\frac{100\%}{N_{nz}}\sum_{y_i>0}\frac{|e_i|}{y_i}\) | Mean absolute percentage error for positive actual values |
+
+Here, \(N_{nz}\) is the number of matched observations with positive actual generation.
+
+Percentage metrics can be misleading when actual generation is zero or close to zero. The implementation's handling of these cases should be checked when interpreting results.
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` to customize settings:
+Create a local environment file from the template:
+
+**Windows PowerShell**
+
+```powershell
+Copy-Item .env.example .env
+```
+
+**macOS/Linux**
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable | Default Value | Description |
-| :--- | :--- | :--- |
-| `APP_NAME` | `WindPulse Wind Forecast Evaluation API` | Name of the application |
-| `APP_ENV` | `development` | Deployment environment (`development`, `test`, `production`) |
-| `HOST` | `0.0.0.0` | Bind host address |
-| `PORT` | `8000` | Port for the Uvicorn ASGI server |
-| `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `ELEXON_BASE_URL` | `https://data.elexon.co.uk/bmrs/api/v1` | Base URL of the Elexon BMRS API |
-| `HTTP_TIMEOUT_SECONDS` | `30.0` | Timeout in seconds for external HTTP requests |
-| `DAY_AHEAD_DECISION_CUTOFF_HOUR` | `12` | Day-ahead decision cutoff hour on day D-1 (0–23 UTC) |
-| `ALLOWED_ORIGINS` | `http://localhost:3000,http://localhost:5173,...` | Comma-separated list of allowed CORS origins for the frontend |
+Configure the variables supported by the backend settings.
 
----
+| Variable | Typical default | Purpose |
+|---|---|---|
+| `APP_NAME` | `WindPulse Wind Forecast Evaluation API` | Application name |
+| `APP_ENV` | `development` | Application environment |
+| `HOST` | `0.0.0.0` | Server bind address |
+| `PORT` | `8000` | Server port |
+| `LOG_LEVEL` | `INFO` | Logging verbosity |
+| `ELEXON_BASE_URL` | `https://data.elexon.co.uk/bmrs/api/v1` | Elexon API base URL |
+| `HTTP_TIMEOUT_SECONDS` | `30.0` | External request timeout |
+| `DAY_AHEAD_DECISION_CUTOFF_HOUR` | `12` | Configured cutoff hour in UTC |
+| `ALLOWED_ORIGINS` | Local frontend origins | Comma-separated CORS origin allowlist |
 
-## Getting Started (Windows PowerShell)
+The defaults above describe the intended configuration. Confirm the actual defaults, validation rules, and accepted formats in `app/config.py` and `.env.example` before changing deployment settings.
+
+Do not commit real credentials or private environment values.
+
+## Getting Started
 
 ### Prerequisites
-- Python 3.11 installed.
 
-### Step 1: Navigate to the project directory
+- Python 3.11 or a compatible version supported by the project.
+- Git.
+- PowerShell on Windows, or a terminal on macOS/Linux.
+
+### 1. Navigate to the backend
+
+From PowerShell:
+
 ```powershell
 cd C:\windpulse\backend
 ```
 
-### Step 2: Create and activate virtual environment
+### 2. Create a virtual environment
+
 ```powershell
 py -3.11 -m venv .venv
+```
+
+Activate it:
+
+```powershell
 .\.venv\Scripts\Activate.ps1
 ```
 
-### Step 3: Install dependencies
+If PowerShell blocks activation, use a permitted activation method for your environment rather than changing system security settings unnecessarily.
+
+### 3. Install dependencies
+
 ```powershell
-pip install --upgrade pip
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Step 4: Run the API server
+### 4. Configure the application
+
+Create `.env` from `.env.example` and review the supported configuration values.
+
+For local development, make sure the backend's CORS configuration allows the frontend's origin, such as `http://localhost:5173`, if that is the port used by Vite.
+
+### 5. Start the API
+
 ```powershell
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-The API will now be live at `http://127.0.0.1:8000`.
-Interactive Swagger UI documentation is available at `http://127.0.0.1:8000/docs`.
+The local API should be available at:
 
----
+- Base URL: http://127.0.0.1:8000
+- Swagger UI: http://127.0.0.1:8000/docs
+- ReDoc: http://127.0.0.1:8000/redoc
+- Health check: http://127.0.0.1:8000/health
 
 ## Running Tests
 
-Execute the automated test suite with `pytest`:
-
-```powershell
-cd C:\windpulse\backend
-.\.venv\Scripts\pytest -v
-```
-
-The default test suite uses controlled fixtures and mocked external dependencies, so it can run without contacting the live Elexon API. Live Elexon reconciliation tests are skipped by default and can be enabled explicitly.
-
-Run the default suite:
+Run the default test suite from the backend directory with the virtual environment activated:
 
 ```powershell
 python -m pytest -v
 ```
 
-To run the live Elexon integration tests:
+The default tests should use mocked external responses where configured, allowing isolated tests to run without depending on live API availability.
+
+If the repository includes optional live Elexon reconciliation tests, follow their implementation and configuration instructions before enabling them. Live tests may depend on network access and current external data.
+
+Do not assume a fixed test count: use the test output from the current repository version as the source of truth.
+
+## API Endpoints
+
+The following endpoints are part of the documented API.
+
+| Method | Endpoint | Purpose |
+|---|---|---|
+| GET | `/health` | Check backend status |
+| GET | `/api/v1/wind/actuals` | Retrieve actual wind generation |
+| GET | `/api/v1/wind/forecasts` | Retrieve wind forecasts |
+| GET | `/api/v1/wind/evaluation` | Retrieve forecast evaluation results |
+
+Use the interactive documentation at `/docs` to confirm supported parameters, response schemas, and validation rules.
+
+### 1. Health check
 
 ```powershell
-$env:RUN_LIVE_ELEXON_TESTS="1"
-python -m pytest -v tests/test_live_elexon_reconciliation.py
+curl.exe http://127.0.0.1:8000/health
 ```
 
-After running the live tests, clear the environment variable:
+Example response:
+
+```json
+{
+  "status": "ok",
+  "app_name": "WindPulse Wind Forecast Evaluation API",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "environment": "development"
+}
+```
+
+The timestamp and environment shown here are illustrative; the running application returns its current values.
+
+### 2. Actual wind generation
 
 ```powershell
-Remove-Item Env:RUN_LIVE_ELEXON_TESTS
+curl.exe "http://127.0.0.1:8000/api/v1/wind/actuals?from_date=2026-01-01&to_date=2026-01-02&limit=2"
 ```
 
-The default suite currently contains 36 tests: 34 pass and 2 live integration tests are skipped.
+This endpoint retrieves actual generation records for the requested date range. Check `/docs` for the precise response fields and accepted parameters.
 
+### 3. Raw wind forecasts
 
----
+```powershell
+curl.exe "http://127.0.0.1:8000/api/v1/wind/forecasts?from_date=2026-01-01&to_date=2026-01-01&limit=2"
+```
 
-## API Endpoints & Usage
+This endpoint retrieves forecast records for the selected target delivery dates. Forecast publication timestamps and target delivery timestamps are distinct and should not be confused.
 
-### 1. Health Check
-- **Endpoint**: `GET /health`
-- **Description**: Verifies backend operational status.
-- **Example Request**:
-  ```powershell
-  curl.exe -X GET "http://127.0.0.1:8000/health"
-  ```
-- **Response Schema**:
-  ```json
-  {
-    "status": "ok",
-    "app_name": "WindPulse Wind Forecast Evaluation API",
-    "timestamp": "2026-10-26T07:50:00.000000Z",
-    "environment": "development"
-  }
-  ```
+### 4. Forecast evaluation
 
----
+```powershell
+curl.exe "http://127.0.0.1:8000/api/v1/wind/evaluation?from_date=2026-01-01&to_date=2026-01-31&include_timeseries=false"
+```
 
-### 2. Actual Wind Generation
-- **Endpoint**: `GET /api/v1/wind/actuals`
-- **Parameters**:
-  - `from_date` *(optional, string, default: "2026-01-01")*: Settlement start date.
-  - `to_date` *(optional, string, default: "2026-01-31")*: Settlement end date.
-  - `limit` *(optional, integer)*: Maximum records to return.
-- **Example Request**:
-  ```powershell
-  curl.exe -X GET "http://127.0.0.1:8000/api/v1/wind/actuals?from_date=2026-01-01&to_date=2026-01-02&limit=2"
-  ```
-- **Response Schema**:
-  ```json
-  {
-    "status": "success",
-    "count": 2,
-    "fromDate": "2026-01-01",
-    "toDate": "2026-01-02",
-    "data": [
-      {
-        "startTime": "2026-01-01T00:00:00Z",
-        "generation": 13756.0,
-        "fuelType": "WIND",
-        "settlementDate": "2026-01-01",
-        "settlementPeriod": 1
-      },
-      {
-        "startTime": "2026-01-01T00:30:00Z",
-        "generation": 13873.0,
-        "fuelType": "WIND",
-        "settlementDate": "2026-01-01",
-        "settlementPeriod": 2
-      }
-    ]
-  }
-  ```
+The evaluation endpoint applies the configured cutoff and returns summary information and accuracy metrics. Set `include_timeseries=false` when only the summary is needed, if supported by the current endpoint schema.
 
----
+You can also specify a cutoff hour if the endpoint supports it:
 
-### 3. Raw Wind Forecasts
-- **Endpoint**: `GET /api/v1/wind/forecasts`
-- **Parameters**:
-  - `from_date` *(optional, string, default: "2026-01-01")*: Target start delivery date.
-  - `to_date` *(optional, string, default: "2026-01-31")*: Target end delivery date.
-  - `limit` *(optional, integer)*: Maximum records to return.
-- **Example Request**:
-  ```powershell
-  curl.exe -X GET "http://127.0.0.1:8000/api/v1/wind/forecasts?from_date=2026-01-01&to_date=2026-01-01&limit=2"
-  ```
-- **Response Schema**:
-  ```json
-  {
-    "status": "success",
-    "count": 2,
-    "fromDate": "2026-01-01",
-    "toDate": "2026-01-01",
-    "data": [
-      {
-        "startTime": "2026-01-01T00:00:00Z",
-        "publishTime": "2025-12-31T11:30:00Z",
-        "generation": 17850.0,
-        "dataset": "WINDFOR"
-      },
-      {
-        "startTime": "2026-01-01T01:00:00Z",
-        "publishTime": "2025-12-31T11:30:00Z",
-        "generation": 18120.0,
-        "dataset": "WINDFOR"
-      }
-    ]
-  }
-  ```
+```powershell
+curl.exe "http://127.0.0.1:8000/api/v1/wind/evaluation?from_date=2026-01-01&to_date=2026-01-31&cutoff_hour=12&include_timeseries=false"
+```
 
----
-
-### 4. Forecast Evaluation & Accuracy Metrics
-- **Endpoint**: `GET /api/v1/wind/evaluation`
-- **Parameters**:
-  - `from_date` *(optional, string, default: "2026-01-01")*: Evaluation start date.
-  - `to_date` *(optional, string, default: "2026-01-31")*: Evaluation end date.
-  - `cutoff_hour` *(optional, integer, default: 12)*: Day-ahead cutoff hour on D-1 (0–23 UTC).
-  - `include_timeseries` *(optional, boolean, default: true)*: Set to `false` to receive only summary and metrics.
-- **Example Request**:
-  ```powershell
-  curl.exe -X GET "http://127.0.0.1:8000/api/v1/wind/evaluation?from_date=2026-01-01&to_date=2026-01-31&include_timeseries=false"
-  ```
-- **Response Schema**:
-  ```json
-  {
-    "status": "success",
-    "summary": {
-      "targetPeriodStart": "2026-01-01T00:00:00Z",
-      "targetPeriodEnd": "2026-01-31T23:30:00Z",
-      "decisionCutoffRule": "Day-Ahead (D-1 at 12:00 UTC)",
-      "totalExpectedHourlyPeriods": 744,
-      "totalActualHalfHourlyPeriods": 1488,
-      "rawForecastRevisionsCount": 18080,
-      "eligibleForecastsCount": 744,
-      "matchedCount": 744,
-      "missingHourlyForecastCount": 0,
-      "missingHourlyActualCount": 0,
-      "unmatchedHalfHourlyActualsCount": 744,
-      "coveragePercentage": 100.0,
-      "totalExpectedPeriods": 744,
-      "actualRecordsCount": 1488,
-      "forecastRecordsCount": 18080,
-      "missingForecastCount": 0,
-      "missingActualCount": 0
-    },
-    "metrics": {
-      "sampleCount": 744,
-      "maeMW": 1845.23,
-      "rmseMW": 2312.65,
-      "biasMW": 412.18,
-      "nmaePercentage": 14.82,
-      "mapePercentage": 16.54,
-      "meanActualMW": 12450.35,
-      "meanForecastMW": 12862.53,
-      "unit": "MW",
-      "definitions": {
-        "errorMW": "Forecast - Actual generation in Megawatts (MW)",
-        "maeMW": "Mean Absolute Error: (1/N) * sum(|Forecast - Actual|)",
-        "rmseMW": "Root Mean Squared Error: sqrt((1/N) * sum((Forecast - Actual)^2))",
-        "biasMW": "Forecast Bias (Mean Error): (1/N) * sum(Forecast - Actual). >0 = over-forecast, <0 = under-forecast",
-        "nmaePercentage": "Normalized MAE: (MAE / Mean(Actual)) * 100%",
-        "mapePercentage": "MAPE: Mean(|Forecast - Actual| / Actual) * 100% for actual > 0"
-      }
-    },
-    "matchedData": [
-      {
-        "startTime": "2026-01-01T00:00:00Z",
-        "targetDate": "2026-01-01",
-        "settlementPeriod": 1,
-        "actualGenerationMW": 13756.0,
-        "forecastGenerationMW": 17850.0,
-        "forecastPublishTime": "2025-12-31T11:30:00Z",
-        "decisionCutoffTime": "2025-12-31T12:00:00Z",
-        "errorMW": 4094.0,
-        "absoluteErrorMW": 4094.0,
-        "percentageError": 29.76
-      }
-    ]
-  }
-  ```
-
----
+Actual response fields and numerical results depend on the API implementation and available source data. Use the live Swagger documentation rather than relying on illustrative values in this README.
 
 ## Docker Deployment
 
-Build and run the containerized backend:
+If Docker is installed and the repository's `Dockerfile` is configured for the backend, build the image from the backend directory:
 
-```bash
-# Build the Docker image
+```powershell
 docker build -t windpulse-backend .
-
-# Run container on port 8000
-docker run -d -p 8000:8000 --name wind-backend windpulse-backend
 ```
 
-Test container health:
-```bash
-curl http://localhost:8000/health
+Run the container:
+
+```powershell
+docker run --rm -p 8000:8000 --name windpulse-backend windpulse-backend
 ```
+
+Check the health endpoint:
+
+```powershell
+curl.exe http://127.0.0.1:8000/health
+```
+
+If the application requires environment variables at runtime, supply them through your deployment configuration or a local environment file that is not committed to Git. Confirm the Dockerfile's entry point and configuration requirements before deploying.
+
+## Frontend Integration
+
+The React frontend can communicate with the backend over HTTP.
+
+### CORS
+
+Configure `ALLOWED_ORIGINS` to include the frontend origin, such as:
+
+```text
+http://localhost:5173
+```
+
+For production, add the exact deployed frontend origin. Avoid allowing arbitrary origins when credentials or sensitive data are involved.
+
+### Dashboard performance
+
+For dashboard summary cards, use the evaluation endpoint's summary-only option if it is supported. This can reduce the amount of time-series data transferred.
+
+### Charts
+
+When the API returns matched time-series records, the frontend can use them to display:
+
+- Actual versus forecast generation.
+- Forecast errors over time.
+- Summary metrics such as MAE, RMSE, and bias.
+- Matched-data coverage and missing observations.
+
+Always use the response schema documented by the running backend.
+
+## AI Tools Used
+
+AI-assisted tools were used as development aids during implementation.
+
+### ChatGPT
+
+Used to assist with:
+
+- Understanding project requirements and backend concepts.
+- Breaking implementation tasks into manageable steps.
+- Troubleshooting errors and exploring possible fixes.
+- Reviewing documentation and improving explanations.
+- Supporting test planning and deployment troubleshooting.
+
+### Antigravity CLI
+
+Used as an AI-assisted development tool to support:
+
+- Backend implementation tasks.
+- Code investigation and debugging.
+- Development workflow assistance.
+- Reviewing changes against project requirements.
+
+AI-generated suggestions were used as development assistance. The implementation, configuration, and test results should be validated against the actual code and running application.
+
+## Security Considerations
+
+- Keep `.env` and other files containing secrets out of version control.
+- Never publish API keys, passwords, access tokens, or private deployment configuration.
+- Restrict CORS to the frontend origins that need access.
+- Validate incoming query parameters and handle external API failures.
+- Do not fabricate missing generation or forecast records.
+- Review logs and error responses to ensure they do not expose secrets.
+
+## Data Source
+
+WindPulse uses the [Elexon BMRS API](https://bmrs.elexon.co.uk/api-documentation/endpoint) for UK electricity market data, including:
+
+- `FUELHH` — half-hourly generation outturn by fuel type.
+- `WINDFOR` — wind generation forecast data.
+
+Refer to the official Elexon documentation for dataset definitions, available endpoints, and data limitations.
 
 ---
 
-## Frontend Integration Notes
-
-When building the React frontend:
-- **CORS**: Enabled by default for `http://localhost:3000` and `http://localhost:5173`. Add additional frontend development ports in `.env` if required.
-- **Fast Dashboard Loading**: For high-level summary cards, request `/api/v1/wind/evaluation?include_timeseries=false` to return the summary and accuracy metrics instantly without transferring the time-series payload.
-- **Charts**: Use `matchedData` to plot actual vs. forecast wind generation side-by-side or to plot a distribution of `errorMW`.
+**WindPulse Wind Forecast Evaluation API** — A Python backend for evaluating UK wind generation forecasts against actual generation data.
